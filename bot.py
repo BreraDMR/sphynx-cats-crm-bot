@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -27,6 +28,8 @@ from database import (
 )
 from catalog_api import NewCat, create_cat, list_cats, delete_cat, CatalogApiError
 from ai_review import review_description, AiReviewUnavailable
+from requests_api import list_requests, RequestsApiError
+from notify_server import create_notify_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +56,10 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0") or "0")
 BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 SITE_API_URL = os.getenv("SITE_API_URL", "")
+SITE_REQUESTS_API_URL = os.getenv("SITE_REQUESTS_API_URL", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
+NOTIFY_PORT = int(os.getenv("NOTIFY_PORT", "8080"))
 
 if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
     logger.error("TELEGRAM_BOT_TOKEN is not set. Please update your .env file.")
@@ -109,6 +114,13 @@ def is_admin(user_id: int) -> bool:
     return admin_status(user_id) in ("owner", "approved")
 
 
+def get_notification_targets() -> list[int]:
+    """Owner + every approved admin -- who a new site request gets pushed to."""
+    targets = {OWNER_ID} if OWNER_ID else set()
+    targets.update(a["telegram_id"] for a in get_all_admins() if a["status"] == "approved")
+    return list(targets)
+
+
 def actor_label(user) -> str:
     return f"@{user.username}" if user.username else user.full_name
 
@@ -139,6 +151,7 @@ def build_command_list(role: str | None) -> list[BotCommand]:
             BotCommand(command="add_cat", description="Додати кошеня в каталог"),
             BotCommand(command="list_cats", description="Список кошенят (усі статуси)"),
             BotCommand(command="delete_cat", description="Видалити кошеня за ID"),
+            BotCommand(command="requests", description="Останні заявки з сайту"),
         ]
     if role == "owner":
         commands += [
@@ -193,6 +206,7 @@ async def command_help_handler(message: Message) -> None:
         lines.append("🐱 /add_cat — додати кошеня (з AI-перевіркою опису)")
         lines.append("📋 /list_cats — список усіх кошенят")
         lines.append("🗑️ /delete_cat &lt;id&gt; — видалити кошеня")
+        lines.append("📨 /requests — останні заявки з сайту (теж приходять автоматично)")
     if status == "owner":
         lines.append("👑 /admins — підтвердження/бан адмінів")
         lines.append("📜 /auditlog — журнал дій")
@@ -605,6 +619,33 @@ async def handle_delete_cat_confirm(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# --- /requests ---
+
+@dp.message(Command("requests"))
+async def command_requests_handler(message: Message) -> None:
+    if not await check_admin_access(message):
+        return
+
+    try:
+        reqs = await list_requests(http_session, SITE_REQUESTS_API_URL, BOT_API_KEY)
+    except RequestsApiError as e:
+        return await message.reply(f"❌ {html.escape(str(e))}")
+
+    if not reqs:
+        return await message.reply("📨 Заявок поки немає.")
+
+    lines = ["📨 <b>ОСТАННІ ЗАЯВКИ З САЙТУ</b>\n"]
+    for r in reqs:
+        lines.append(
+            f"🆔 <code>{r['id']}</code> | {html.escape(r['name'])} | {html.escape(r['email'])}"
+            f"{' | ' + html.escape(r['phone']) if r.get('phone') else ''} | {html.escape(r['status'])}"
+        )
+
+    text = "\n".join(lines)
+    for chunk_start in range(0, len(text), 4096):
+        await message.reply(text[chunk_start:chunk_start + 4096])
+
+
 # --- STARTUP ---
 
 async def main() -> None:
@@ -616,10 +657,23 @@ async def main() -> None:
         await apply_user_commands(OWNER_ID, "owner")
 
     http_session = aiohttp.ClientSession()
+
+    # The notify server runs in the same process as the long-polling bot --
+    # it's how api.php on the website pushes new contact-form requests here
+    # (see notify_server.py). Internal-only: reachable from other containers
+    # on the same Docker network, never published to the host/internet.
+    notify_app = create_notify_app(bot, BOT_API_KEY, get_notification_targets)
+    runner = web.AppRunner(notify_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", NOTIFY_PORT)
+    await site.start()
+    logger.info(f"Notify server listening on :{NOTIFY_PORT}")
+
     logger.info("Starting Sphynx Cats CRM bot polling...")
     try:
         await dp.start_polling(bot)
     finally:
+        await runner.cleanup()
         await http_session.close()
         await bot.session.close()
 

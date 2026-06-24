@@ -30,6 +30,12 @@ full picture.
   never overwrites anything silently.
 - **`/list_cats` / `/delete_cat`** — manage what's already in the catalog,
   including draft cards not yet visible to site visitors.
+- **Live request notifications.** The website pushes every new
+  contact-form submission to the bot's own internal HTTP endpoint
+  (`notify_server.py`, running alongside the long-polling loop in the
+  same process), which forwards it to the owner and every approved admin
+  in Telegram. `/requests` pulls the current list on demand too, in case
+  a push was missed while the bot was offline.
 - **Admin management & audit log.** The owner can ban/unban admins
   (`/admins`) and review every approve/reject/ban/add/delete action
   (`/auditlog`).
@@ -70,6 +76,7 @@ database connection.
 | `/add_cat` | admins | Add a new kitten card, with AI description review |
 | `/list_cats` | admins | List every kitten, including drafts |
 | `/delete_cat <id>` | admins | Remove a kitten card (with confirmation) |
+| `/requests` | admins | Pull the latest contact-form requests from the site |
 | `/admins` | owner only | Approve/ban/unban admins |
 | `/auditlog` | owner only | Recent admin actions |
 

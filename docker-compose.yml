@@ -12,5 +12,10 @@ services:
       - DB_PATH=/app/data/sphynx_crm_bot.db
     volumes:
       - ./data:/app/data
+    # Uncomment if the website isn't on the same Docker network as this
+    # bot (e.g. running standalone, not as part of the sphynx homelab) --
+    # the site needs to reach NOTIFY_PORT to push new requests here.
+    # ports:
+    #   - "8080:8080"
     restart: unless-stopped
     command: python bot.py
