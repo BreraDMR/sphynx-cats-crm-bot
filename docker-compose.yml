@@ -1,0 +1,16 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sphynx_cats_crm_bot
+    env_file:
+      - .env
+    environment:
+      # SQLite file lives in the mounted volume, not the image layer, so
+      # admin/audit data survives a rebuild.
+      - DB_PATH=/app/data/sphynx_crm_bot.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    command: python bot.py
