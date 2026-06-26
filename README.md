@@ -1,9 +1,17 @@
+<div align="center">
+
 # 🐱 Sphynx Cats CRM Bot
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-active-brightgreen)
+**Manage a website's catalogs from your phone over Telegram — guided add flows, owner-approved admins, and a local-AI grammar pass on every listing.**
+
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white&style=for-the-badge)](requirements.txt)
+[![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white&style=for-the-badge)](requirements.txt)
+[![Ollama](https://img.shields.io/badge/Ollama-local%20AI-000000?logo=ollama&logoColor=white&style=for-the-badge)](ai_review.py)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white&style=for-the-badge)](docker-compose.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
+[![status](https://img.shields.io/badge/status-active-brightgreen?style=for-the-badge)](#)
+
+</div>
 
 A Telegram bot that lets the team behind
 [sphynx-cattery-website](https://github.com/BreraDMR/sphynx-cattery-website)
