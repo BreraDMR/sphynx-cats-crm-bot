@@ -56,9 +56,45 @@ def init_db() -> None:
     );
     """)
 
+    # Per-user preferences. Right now this only holds which AI model an admin
+    # picked for the description review (/model): 'weak' (fast, qwen2.5:3b) or
+    # 'strong' (smarter, qwen2.5:14b). Keyed by telegram_id so it covers the
+    # owner too (who has no row in `admins`).
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_settings (
+        telegram_id INTEGER PRIMARY KEY,
+        ai_model TEXT NOT NULL DEFAULT 'weak', -- weak | strong
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully.")
+
+
+def get_model_pref(telegram_id: int) -> str:
+    """Returns 'weak' or 'strong' -- defaults to 'weak' for a first-time user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ai_model FROM user_settings WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["ai_model"] if row and row["ai_model"] in ("weak", "strong") else "weak"
+
+
+def set_model_pref(telegram_id: int, model: str) -> None:
+    if model not in ("weak", "strong"):
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO user_settings (telegram_id, ai_model) VALUES (?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET ai_model = excluded.ai_model, updated_at = CURRENT_TIMESTAMP",
+        (telegram_id, model),
+    )
+    conn.commit()
+    conn.close()
 
 
 def hash_password(password: str) -> str:

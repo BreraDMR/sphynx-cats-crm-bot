@@ -24,9 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import (
     init_db, get_admin, register_admin, is_login_taken,
-    get_all_admins, update_admin_status, add_audit_log, get_audit_log
+    get_all_admins, update_admin_status, add_audit_log, get_audit_log,
+    get_model_pref, set_model_pref
 )
 from catalog_api import NewCat, create_cat, list_cats, delete_cat, CatalogApiError
+from treats_api import NewTreat, create_treat, list_treats, delete_treat, TreatsApiError
 from ai_review import review_description, AiReviewUnavailable
 from requests_api import list_requests, RequestsApiError
 from notify_server import create_notify_app
@@ -57,8 +59,13 @@ OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0") or "0")
 BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 SITE_API_URL = os.getenv("SITE_API_URL", "")
 SITE_REQUESTS_API_URL = os.getenv("SITE_REQUESTS_API_URL", "")
+SITE_TREATS_API_URL = os.getenv("SITE_TREATS_API_URL", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+# Two AI models: the fast/weak default and a smarter/slower one. Each admin
+# picks which to use via /model (stored per-user); the choice is resolved by
+# resolve_model() and passed to the Ollama description review.
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
+CHAT_MODEL_STRONG = os.getenv("CHAT_MODEL_STRONG", "qwen2.5:14b")
 NOTIFY_PORT = int(os.getenv("NOTIFY_PORT", "8080"))
 
 if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -74,6 +81,25 @@ if not BOT_API_KEY or not SITE_API_URL:
 # Same color list as CatValidator::COLORS on the website (site/src/CatValidator.php) --
 # the two projects don't share code, so keep these two lists in sync by hand.
 COLORS = ["чорний", "білий", "блакитний", "кремовий", "лиловий", "інший"]
+
+# Treat categories: canonical keys must match TreatValidator::CATEGORIES on the
+# website (site/src/TreatValidator.php); the Ukrainian labels are just for the
+# bot's keyboard. Keep the keys in sync by hand.
+TREAT_CATEGORIES = {
+    "snacks": "Ласощі",
+    "food": "Корм",
+    "vitamins": "Вітаміни",
+    "toys": "Іграшки",
+    "care": "Догляд",
+}
+
+# Human labels for the two model tiers (shown in /model).
+MODEL_LABELS = {"weak": "Слабка (швидка)", "strong": "Сильна (розумніша)"}
+
+
+def resolve_model(user_id: int) -> str:
+    """Map a user's 'weak'/'strong' preference to the actual Ollama model name."""
+    return CHAT_MODEL_STRONG if get_model_pref(user_id) == "strong" else CHAT_MODEL
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -91,6 +117,16 @@ class AddCatStates(StatesGroup):
     waiting_color = State()
     waiting_age = State()
     waiting_price = State()
+    waiting_description = State()
+    reviewing_description = State()
+    waiting_photo = State()
+
+
+class AddTreatStates(StatesGroup):
+    waiting_name = State()
+    waiting_category = State()
+    waiting_price = State()
+    waiting_weight = State()
     waiting_description = State()
     reviewing_description = State()
     waiting_photo = State()
@@ -151,6 +187,10 @@ def build_command_list(role: str | None) -> list[BotCommand]:
             BotCommand(command="add_cat", description="Додати кошеня в каталог"),
             BotCommand(command="list_cats", description="Список кошенят (усі статуси)"),
             BotCommand(command="delete_cat", description="Видалити кошеня за ID"),
+            BotCommand(command="add_treat", description="Додати смаколик у каталог"),
+            BotCommand(command="list_treats", description="Список смаколиків (усі статуси)"),
+            BotCommand(command="delete_treat", description="Видалити смаколик за ID"),
+            BotCommand(command="model", description="Вибір моделі ШІ для перевірки тексту"),
             BotCommand(command="requests", description="Останні заявки з сайту"),
         ]
     if role == "owner":
@@ -206,6 +246,10 @@ async def command_help_handler(message: Message) -> None:
         lines.append("🐱 /add_cat — додати кошеня (з AI-перевіркою опису)")
         lines.append("📋 /list_cats — список усіх кошенят")
         lines.append("🗑️ /delete_cat &lt;id&gt; — видалити кошеня")
+        lines.append("🍖 /add_treat — додати смаколик (з AI-перевіркою опису)")
+        lines.append("📋 /list_treats — список усіх смаколиків")
+        lines.append("🗑️ /delete_treat &lt;id&gt; — видалити смаколик")
+        lines.append("🤖 /model — вибрати модель ШІ (слабка/сильна)")
         lines.append("📨 /requests — останні заявки з сайту (теж приходять автоматично)")
     if status == "owner":
         lines.append("👑 /admins — підтвердження/бан адмінів")
@@ -473,7 +517,7 @@ async def process_cat_description(message: Message, state: FSMContext) -> None:
 
     status_msg = await message.reply("⏳ Перевіряю текст через Ollama...")
     try:
-        suggestion = await review_description(http_session, OLLAMA_URL, CHAT_MODEL, description)
+        suggestion = await review_description(http_session, OLLAMA_URL, resolve_model(message.from_user.id), description)
     except AiReviewUnavailable:
         logger.exception("AI review unavailable, falling back to the admin's original text")
         await status_msg.edit_text("⚠️ AI-перевірка зараз недоступна, використовую ваш текст без змін.")
@@ -613,6 +657,272 @@ async def handle_delete_cat_confirm(callback: CallbackQuery) -> None:
             return await callback.answer()
         add_audit_log(callback.from_user.id, actor_label(callback.from_user), "delete_cat", details=f"id={cat_id}")
         await callback.message.edit_text(f"🗑️ Кошеня <code>#{cat_id}</code> видалено.")
+    else:
+        await callback.message.edit_text("Скасовано.")
+
+    await callback.answer()
+
+
+# --- /model (per-admin AI model choice) ---
+
+def model_keyboard(current: str) -> InlineKeyboardMarkup:
+    def label(key: str) -> str:
+        mark = "✅ " if key == current else ""
+        return mark + MODEL_LABELS[key]
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label("weak"), callback_data="model_set_weak"),
+        InlineKeyboardButton(text=label("strong"), callback_data="model_set_strong"),
+    ]])
+
+
+@dp.message(Command("model"))
+async def command_model_handler(message: Message) -> None:
+    if not await check_admin_access(message):
+        return
+    pref = get_model_pref(message.from_user.id)
+    model_name = CHAT_MODEL_STRONG if pref == "strong" else CHAT_MODEL
+    await message.reply(
+        "🤖 <b>Модель ШІ для перевірки опису</b>\n\n"
+        f"Зараз обрано: <b>{html.escape(MODEL_LABELS[pref])}</b> (<code>{html.escape(model_name)}</code>)\n\n"
+        "▫️ <b>Слабка</b> — швидша, але простіша.\n"
+        "▫️ <b>Сильна</b> — розумніша, але відповідає повільніше.\n"
+        "Швидкість не критична — обирай ту, що дає кращий текст.",
+        reply_markup=model_keyboard(pref),
+    )
+
+
+@dp.callback_query(F.data.in_(["model_set_weak", "model_set_strong"]))
+async def handle_model_choice(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Немає прав.", show_alert=True)
+
+    pref = "strong" if callback.data == "model_set_strong" else "weak"
+    set_model_pref(callback.from_user.id, pref)
+    model_name = CHAT_MODEL_STRONG if pref == "strong" else CHAT_MODEL
+    add_audit_log(callback.from_user.id, actor_label(callback.from_user), "set_model", details=pref)
+
+    await callback.message.edit_text(
+        "🤖 <b>Модель ШІ для перевірки опису</b>\n\n"
+        f"Обрано: <b>{html.escape(MODEL_LABELS[pref])}</b> (<code>{html.escape(model_name)}</code>)",
+        reply_markup=model_keyboard(pref),
+    )
+    await callback.answer("Збережено.")
+
+
+# --- /add_treat ---
+
+def treat_categories_keyboard() -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text=label, callback_data=f"treat_cat_{key}")] for key, label in TREAT_CATEGORIES.items()]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("add_treat"))
+async def command_add_treat_handler(message: Message, state: FSMContext) -> None:
+    if not await check_admin_access(message):
+        return
+    await state.set_state(AddTreatStates.waiting_name)
+    await message.reply("🍖 Додаємо новий смаколик.\nНадішліть <b>назву</b>:")
+
+
+@dp.message(AddTreatStates.waiting_name, F.text)
+async def process_treat_name(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if len(name) < 2:
+        return await message.reply("❌ Назва занадто коротка. Спробуйте ще раз:")
+    await state.update_data(name=name)
+    await state.set_state(AddTreatStates.waiting_category)
+    await message.reply("🏷️ Оберіть категорію:", reply_markup=treat_categories_keyboard())
+
+
+@dp.callback_query(AddTreatStates.waiting_category, F.data.startswith("treat_cat_"))
+async def process_treat_category(callback: CallbackQuery, state: FSMContext) -> None:
+    category = callback.data.removeprefix("treat_cat_")
+    await state.update_data(category=category)
+    await state.set_state(AddTreatStates.waiting_price)
+    await callback.message.edit_text(f"🏷️ Категорія: <b>{html.escape(TREAT_CATEGORIES.get(category, category))}</b>")
+    await callback.message.answer("💶 Яка ціна в євро? (число)")
+    await callback.answer()
+
+
+@dp.message(AddTreatStates.waiting_price, F.text)
+async def process_treat_price(message: Message, state: FSMContext) -> None:
+    try:
+        price = int(message.text.strip())
+        if price <= 0 or price > 100_000:
+            raise ValueError
+    except ValueError:
+        return await message.reply("❌ Введіть додатню ціну в євро (наприклад, 12):")
+
+    await state.update_data(price_eur=price)
+    await state.set_state(AddTreatStates.waiting_weight)
+    await message.reply("⚖️ Вага в грамах? (число; 0 — якщо не застосовно, напр. для іграшок)")
+
+
+@dp.message(AddTreatStates.waiting_weight, F.text)
+async def process_treat_weight(message: Message, state: FSMContext) -> None:
+    try:
+        weight = int(message.text.strip())
+        if weight < 0 or weight > 100_000:
+            raise ValueError
+    except ValueError:
+        return await message.reply("❌ Введіть вагу в грамах (0 або додатнє число):")
+
+    await state.update_data(weight_g=weight)
+    await state.set_state(AddTreatStates.waiting_description)
+    await message.reply("📝 Надішліть опис смаколика (мінімум 10 символів). Перед публікацією я перевірю текст через AI.")
+
+
+@dp.message(AddTreatStates.waiting_description, F.text)
+async def process_treat_description(message: Message, state: FSMContext) -> None:
+    description = message.text.strip()
+    if len(description) < 10:
+        return await message.reply("❌ Опис занадто короткий (мінімум 10 символів). Спробуйте ще раз:")
+
+    await state.update_data(original_description=description, final_description=description)
+
+    status_msg = await message.reply("⏳ Перевіряю текст через Ollama...")
+    try:
+        suggestion = await review_description(http_session, OLLAMA_URL, resolve_model(message.from_user.id), description)
+    except AiReviewUnavailable:
+        logger.exception("AI review unavailable, falling back to the admin's original text")
+        await status_msg.edit_text("⚠️ AI-перевірка зараз недоступна, використовую ваш текст без змін.")
+        await state.set_state(AddTreatStates.waiting_photo)
+        return await message.answer("📷 Надішліть фото смаколика, або /skip щоб додати без фото.")
+
+    if suggestion.strip() == description.strip():
+        await status_msg.edit_text("✅ AI не знайшов помилок у тексті.")
+        await state.set_state(AddTreatStates.waiting_photo)
+        return await message.answer("📷 Надішліть фото смаколика, або /skip щоб додати без фото.")
+
+    await state.update_data(ai_suggestion=suggestion)
+    await state.set_state(AddTreatStates.reviewing_description)
+    await status_msg.edit_text(
+        f"<b>Ваш варіант:</b>\n{html.escape(description)}\n\n"
+        f"<b>Варіант AI:</b>\n{html.escape(suggestion)}",
+        reply_markup=description_review_keyboard(),
+    )
+
+
+@dp.callback_query(AddTreatStates.reviewing_description, F.data.in_(["desc_use_ai", "desc_keep_mine", "desc_retry"]))
+async def process_treat_description_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+
+    if callback.data == "desc_retry":
+        await state.set_state(AddTreatStates.waiting_description)
+        await callback.message.edit_text("✏️ Надішліть новий опис смаколика:")
+        return await callback.answer()
+
+    final = data["ai_suggestion"] if callback.data == "desc_use_ai" else data["original_description"]
+    await state.update_data(final_description=final)
+    await state.set_state(AddTreatStates.waiting_photo)
+    await callback.message.edit_text(f"📝 Опис збережено:\n{html.escape(final)}")
+    await callback.message.answer("📷 Надішліть фото смаколика, або /skip щоб додати без фото.")
+    await callback.answer()
+
+
+async def finalize_treat_creation(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    treat = NewTreat(
+        name=data["name"],
+        category=data["category"],
+        price_eur=data["price_eur"],
+        weight_g=data["weight_g"],
+        description=data["final_description"],
+        created_by=f"bot:{actor_label(message.from_user)}",
+        photo_bytes=data.get("photo_bytes"),
+        photo_filename=data.get("photo_filename"),
+    )
+
+    try:
+        result = await create_treat(http_session, SITE_TREATS_API_URL, BOT_API_KEY, treat)
+    except TreatsApiError as e:
+        await message.reply(f"❌ Не вдалося додати смаколик: {html.escape(str(e))}")
+        await state.clear()
+        return
+
+    created = result.get("treat", {})
+    add_audit_log(message.from_user.id, actor_label(message.from_user), "add_treat", details=f"id={created.get('id')} name={treat.name}")
+    await message.reply(
+        f"🎉 Смаколик додано на сайт!\n"
+        f"🆔 ID: <code>{created.get('id')}</code>\n"
+        f"🔗 Slug: <code>{html.escape(created.get('slug', ''))}</code>"
+    )
+    await state.clear()
+
+
+@dp.message(AddTreatStates.waiting_photo, F.photo)
+async def process_treat_photo(message: Message, state: FSMContext) -> None:
+    photo = message.photo[-1]
+    buffer = await bot.download(photo)
+    await state.update_data(photo_bytes=buffer.read(), photo_filename=f"{photo.file_unique_id}.jpg")
+    await finalize_treat_creation(message, state)
+
+
+@dp.message(AddTreatStates.waiting_photo, Command("skip"))
+async def process_treat_skip_photo(message: Message, state: FSMContext) -> None:
+    await finalize_treat_creation(message, state)
+
+
+# --- /list_treats, /delete_treat ---
+
+@dp.message(Command("list_treats"))
+async def command_list_treats_handler(message: Message) -> None:
+    if not await check_admin_access(message):
+        return
+
+    try:
+        treats = await list_treats(http_session, SITE_TREATS_API_URL, BOT_API_KEY)
+    except TreatsApiError as e:
+        return await message.reply(f"❌ {html.escape(str(e))}")
+
+    if not treats:
+        return await message.reply("📋 Каталог смаколиків порожній.")
+
+    status_icons = {"published": "✅", "draft": "📝"}
+    lines = ["📋 <b>СМАКОЛИКИ В КАТАЛОЗІ</b>\n"]
+    for t in treats:
+        icon = status_icons.get(t["status"], "❔")
+        cat = TREAT_CATEGORIES.get(t["category"], t["category"])
+        lines.append(f"{icon} <code>#{t['id']}</code> {html.escape(t['name'])} — {html.escape(cat)}, {t['price_eur']}€")
+
+    text = "\n".join(lines)
+    for chunk_start in range(0, len(text), 4096):
+        await message.reply(text[chunk_start:chunk_start + 4096])
+
+
+@dp.message(Command("delete_treat"))
+async def command_delete_treat_handler(message: Message) -> None:
+    if not await check_admin_access(message):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().isdigit():
+        return await message.reply("Використання: <code>/delete_treat ID</code>")
+
+    treat_id = int(parts[1].strip())
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Видалити", callback_data=f"deltreat_yes_{treat_id}"),
+        InlineKeyboardButton(text="❌ Скасувати", callback_data=f"deltreat_no_{treat_id}"),
+    ]])
+    await message.reply(f"Видалити смаколик <code>#{treat_id}</code> з каталогу?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("deltreat_yes_") | F.data.startswith("deltreat_no_"))
+async def handle_delete_treat_confirm(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Немає прав.", show_alert=True)
+
+    action, _, treat_id = callback.data.rpartition("_")
+    treat_id = int(treat_id)
+
+    if action.endswith("yes"):
+        try:
+            await delete_treat(http_session, SITE_TREATS_API_URL, BOT_API_KEY, treat_id)
+        except TreatsApiError as e:
+            await callback.message.edit_text(f"❌ {html.escape(str(e))}")
+            return await callback.answer()
+        add_audit_log(callback.from_user.id, actor_label(callback.from_user), "delete_treat", details=f"id={treat_id}")
+        await callback.message.edit_text(f"🗑️ Смаколик <code>#{treat_id}</code> видалено.")
     else:
         await callback.message.edit_text("Скасовано.")
 
