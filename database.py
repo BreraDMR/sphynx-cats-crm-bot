@@ -56,35 +56,48 @@ def init_db() -> None:
     );
     """)
 
-    # Per-user preferences. Right now this only holds which AI model an admin
-    # picked for the description review (/model): 'weak' (fast, qwen2.5:3b) or
-    # 'strong' (smarter, qwen2.5:14b). Keyed by telegram_id so it covers the
-    # owner too (who has no row in `admins`).
+    # Per-user preferences. Holds which AI model tier an admin picked for the
+    # description review (/model): 'weak' (fast, qwen2.5:3b), 'strong' (smarter,
+    # qwen2.5:14b) or 'very_strong' (qwen3:30b-a3b). Plus ai_memory: when on (1)
+    # the chosen model is kept resident in Ollama for an hour after use instead
+    # of the usual few minutes. Keyed by telegram_id so it covers the owner too
+    # (who has no row in `admins`).
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS user_settings (
         telegram_id INTEGER PRIMARY KEY,
-        ai_model TEXT NOT NULL DEFAULT 'weak', -- weak | strong
+        ai_model TEXT NOT NULL DEFAULT 'weak', -- weak | strong | very_strong
+        ai_memory INTEGER NOT NULL DEFAULT 0,  -- 0 = unload after ~5m, 1 = keep 1h
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Migration: add ai_memory to user_settings tables created before it existed.
+    existing_cols = {row["name"] for row in cursor.execute("PRAGMA table_info(user_settings)")}
+    if "ai_memory" not in existing_cols:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN ai_memory INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully.")
 
 
+# The AI model tiers an admin can pick via /model. Keep in sync with the
+# CHAT_MODEL* env vars resolved in bot.py.
+MODEL_TIERS = ("weak", "strong", "very_strong")
+
+
 def get_model_pref(telegram_id: int) -> str:
-    """Returns 'weak' or 'strong' -- defaults to 'weak' for a first-time user."""
+    """Returns a tier from MODEL_TIERS -- defaults to 'weak' for a first-time user."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT ai_model FROM user_settings WHERE telegram_id = ?", (telegram_id,))
     row = cursor.fetchone()
     conn.close()
-    return row["ai_model"] if row and row["ai_model"] in ("weak", "strong") else "weak"
+    return row["ai_model"] if row and row["ai_model"] in MODEL_TIERS else "weak"
 
 
 def set_model_pref(telegram_id: int, model: str) -> None:
-    if model not in ("weak", "strong"):
+    if model not in MODEL_TIERS:
         return
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -92,6 +105,28 @@ def set_model_pref(telegram_id: int, model: str) -> None:
         "INSERT INTO user_settings (telegram_id, ai_model) VALUES (?, ?) "
         "ON CONFLICT(telegram_id) DO UPDATE SET ai_model = excluded.ai_model, updated_at = CURRENT_TIMESTAMP",
         (telegram_id, model),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_memory_pref(telegram_id: int) -> bool:
+    """Whether the admin enabled 'memory' (keep the model resident for an hour)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ai_memory FROM user_settings WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row["ai_memory"]) if row else False
+
+
+def set_memory_pref(telegram_id: int, enabled: bool) -> None:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO user_settings (telegram_id, ai_memory) VALUES (?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET ai_memory = excluded.ai_memory, updated_at = CURRENT_TIMESTAMP",
+        (telegram_id, 1 if enabled else 0),
     )
     conn.commit()
     conn.close()

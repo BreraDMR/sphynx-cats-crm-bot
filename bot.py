@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from database import (
     init_db, get_admin, register_admin, is_login_taken,
     get_all_admins, update_admin_status, add_audit_log, get_audit_log,
-    get_model_pref, set_model_pref
+    get_model_pref, set_model_pref, get_memory_pref, set_memory_pref,
+    MODEL_TIERS
 )
 from catalog_api import NewCat, create_cat, list_cats, delete_cat, CatalogApiError
 from treats_api import NewTreat, create_treat, list_treats, delete_treat, TreatsApiError
@@ -61,11 +62,18 @@ SITE_API_URL = os.getenv("SITE_API_URL", "")
 SITE_REQUESTS_API_URL = os.getenv("SITE_REQUESTS_API_URL", "")
 SITE_TREATS_API_URL = os.getenv("SITE_TREATS_API_URL", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-# Two AI models: the fast/weak default and a smarter/slower one. Each admin
-# picks which to use via /model (stored per-user); the choice is resolved by
-# resolve_model() and passed to the Ollama description review.
+# Three AI model tiers: fast/weak default, a smarter one, and a heavy one. Each
+# admin picks which to use via /model (stored per-user); the choice is resolved
+# by resolve_model() and passed to the Ollama description review.
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
 CHAT_MODEL_STRONG = os.getenv("CHAT_MODEL_STRONG", "qwen2.5:14b")
+CHAT_MODEL_VERY_STRONG = os.getenv("CHAT_MODEL_VERY_STRONG", "qwen3:30b-a3b")
+
+# How long Ollama keeps the chosen model resident after a request, depending on
+# the per-admin /memory toggle: off unloads it soon (frees RAM for other bots),
+# on pins it for an hour so back-to-back reviews stay warm.
+KEEP_ALIVE_OFF = "5m"
+KEEP_ALIVE_ON = "1h"
 NOTIFY_PORT = int(os.getenv("NOTIFY_PORT", "8080"))
 
 if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -93,13 +101,29 @@ TREAT_CATEGORIES = {
     "care": "Догляд",
 }
 
-# Human labels for the two model tiers (shown in /model).
-MODEL_LABELS = {"weak": "Слабка (швидка)", "strong": "Сильна (розумніша)"}
+# Human labels for the model tiers (shown in /model), and the actual Ollama
+# model name behind each tier. Keep the keys in sync with MODEL_TIERS in
+# database.py.
+MODEL_LABELS = {
+    "weak": "Слабка (швидка)",
+    "strong": "Сильна (розумніша)",
+    "very_strong": "Дуже сильна (найрозумніша)",
+}
+MODEL_NAMES = {
+    "weak": CHAT_MODEL,
+    "strong": CHAT_MODEL_STRONG,
+    "very_strong": CHAT_MODEL_VERY_STRONG,
+}
 
 
 def resolve_model(user_id: int) -> str:
-    """Map a user's 'weak'/'strong' preference to the actual Ollama model name."""
-    return CHAT_MODEL_STRONG if get_model_pref(user_id) == "strong" else CHAT_MODEL
+    """Map a user's tier preference to the actual Ollama model name."""
+    return MODEL_NAMES.get(get_model_pref(user_id), CHAT_MODEL)
+
+
+def resolve_keep_alive(user_id: int) -> str:
+    """How long to keep the model resident, based on the admin's /memory toggle."""
+    return KEEP_ALIVE_ON if get_memory_pref(user_id) else KEEP_ALIVE_OFF
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -190,7 +214,7 @@ def build_command_list(role: str | None) -> list[BotCommand]:
             BotCommand(command="add_treat", description="Додати смаколик у каталог"),
             BotCommand(command="list_treats", description="Список смаколиків (усі статуси)"),
             BotCommand(command="delete_treat", description="Видалити смаколик за ID"),
-            BotCommand(command="model", description="Вибір моделі ШІ для перевірки тексту"),
+            BotCommand(command="model", description="Модель ШІ та пам'ять для перевірки тексту"),
             BotCommand(command="requests", description="Останні заявки з сайту"),
         ]
     if role == "owner":
@@ -249,7 +273,7 @@ async def command_help_handler(message: Message) -> None:
         lines.append("🍖 /add_treat — додати смаколик (з AI-перевіркою опису)")
         lines.append("📋 /list_treats — список усіх смаколиків")
         lines.append("🗑️ /delete_treat &lt;id&gt; — видалити смаколик")
-        lines.append("🤖 /model — вибрати модель ШІ (слабка/сильна)")
+        lines.append("🤖 /model — модель ШІ (слабка/сильна/дуже сильна) + пам'ять")
         lines.append("📨 /requests — останні заявки з сайту (теж приходять автоматично)")
     if status == "owner":
         lines.append("👑 /admins — підтвердження/бан адмінів")
@@ -517,7 +541,10 @@ async def process_cat_description(message: Message, state: FSMContext) -> None:
 
     status_msg = await message.reply("⏳ Перевіряю текст через Ollama...")
     try:
-        suggestion = await review_description(http_session, OLLAMA_URL, resolve_model(message.from_user.id), description)
+        suggestion = await review_description(
+            http_session, OLLAMA_URL, resolve_model(message.from_user.id), description,
+            keep_alive=resolve_keep_alive(message.from_user.id),
+        )
     except AiReviewUnavailable:
         logger.exception("AI review unavailable, falling back to the admin's original text")
         await status_msg.edit_text("⚠️ AI-перевірка зараз недоступна, використовую ваш текст без змін.")
@@ -663,50 +690,89 @@ async def handle_delete_cat_confirm(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# --- /model (per-admin AI model choice) ---
+# --- /model (per-admin AI model choice + memory toggle) ---
 
-def model_keyboard(current: str) -> InlineKeyboardMarkup:
-    def label(key: str) -> str:
-        mark = "✅ " if key == current else ""
-        return mark + MODEL_LABELS[key]
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label("weak"), callback_data="model_set_weak"),
-        InlineKeyboardButton(text=label("strong"), callback_data="model_set_strong"),
-    ]])
+def model_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    current = get_model_pref(user_id)
+    memory_on = get_memory_pref(user_id)
+
+    rows = []
+    for key in MODEL_TIERS:
+        mark = "✅ " if key == current else "▫️ "
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{MODEL_LABELS[key]} · {MODEL_NAMES[key]}",
+            callback_data=f"model_set_{key}",
+        )])
+
+    mem_label = "🧠 Пам'ять: 🟢 увімкнена" if memory_on else "🧠 Пам'ять: 🔴 вимкнена"
+    rows.append([InlineKeyboardButton(text=mem_label, callback_data="model_memory_toggle")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def model_settings_text(user_id: int) -> str:
+    pref = get_model_pref(user_id)
+    memory_on = get_memory_pref(user_id)
+    mem_line = (
+        "🟢 <b>увімкнена</b> — модель тримається в пам'яті годину після відповіді."
+        if memory_on else
+        "🔴 <b>вимкнена</b> — модель вивантажується за кілька хвилин, звільняючи пам'ять."
+    )
+    return (
+        "🤖 <b>Модель ШІ для перевірки опису</b>\n\n"
+        f"Зараз обрано: <b>{html.escape(MODEL_LABELS[pref])}</b> "
+        f"(<code>{html.escape(MODEL_NAMES[pref])}</code>)\n\n"
+        "▫️ <b>Слабка</b> — швидша, але простіша.\n"
+        "▫️ <b>Сильна</b> — розумніша, повільніша.\n"
+        "▫️ <b>Дуже сильна</b> — найрозумніша, але найповільніша.\n"
+        "Швидкість не критична — обирай ту, що дає кращий текст.\n\n"
+        f"🧠 <b>Пам'ять:</b> {mem_line}"
+    )
 
 
 @dp.message(Command("model"))
 async def command_model_handler(message: Message) -> None:
     if not await check_admin_access(message):
         return
-    pref = get_model_pref(message.from_user.id)
-    model_name = CHAT_MODEL_STRONG if pref == "strong" else CHAT_MODEL
     await message.reply(
-        "🤖 <b>Модель ШІ для перевірки опису</b>\n\n"
-        f"Зараз обрано: <b>{html.escape(MODEL_LABELS[pref])}</b> (<code>{html.escape(model_name)}</code>)\n\n"
-        "▫️ <b>Слабка</b> — швидша, але простіша.\n"
-        "▫️ <b>Сильна</b> — розумніша, але відповідає повільніше.\n"
-        "Швидкість не критична — обирай ту, що дає кращий текст.",
-        reply_markup=model_keyboard(pref),
+        model_settings_text(message.from_user.id),
+        reply_markup=model_keyboard(message.from_user.id),
     )
 
 
-@dp.callback_query(F.data.in_(["model_set_weak", "model_set_strong"]))
+@dp.callback_query(F.data.startswith("model_set_"))
 async def handle_model_choice(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return await callback.answer("Немає прав.", show_alert=True)
 
-    pref = "strong" if callback.data == "model_set_strong" else "weak"
+    pref = callback.data.removeprefix("model_set_")
+    if pref not in MODEL_TIERS:
+        return await callback.answer()
     set_model_pref(callback.from_user.id, pref)
-    model_name = CHAT_MODEL_STRONG if pref == "strong" else CHAT_MODEL
     add_audit_log(callback.from_user.id, actor_label(callback.from_user), "set_model", details=pref)
 
     await callback.message.edit_text(
-        "🤖 <b>Модель ШІ для перевірки опису</b>\n\n"
-        f"Обрано: <b>{html.escape(MODEL_LABELS[pref])}</b> (<code>{html.escape(model_name)}</code>)",
-        reply_markup=model_keyboard(pref),
+        model_settings_text(callback.from_user.id),
+        reply_markup=model_keyboard(callback.from_user.id),
     )
     await callback.answer("Збережено.")
+
+
+@dp.callback_query(F.data == "model_memory_toggle")
+async def handle_memory_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return await callback.answer("Немає прав.", show_alert=True)
+
+    new_state = not get_memory_pref(callback.from_user.id)
+    set_memory_pref(callback.from_user.id, new_state)
+    add_audit_log(callback.from_user.id, actor_label(callback.from_user),
+                  "set_memory", details="on" if new_state else "off")
+
+    await callback.message.edit_text(
+        model_settings_text(callback.from_user.id),
+        reply_markup=model_keyboard(callback.from_user.id),
+    )
+    await callback.answer("Пам'ять увімкнена." if new_state else "Пам'ять вимкнена.")
 
 
 # --- /add_treat ---
@@ -782,7 +848,10 @@ async def process_treat_description(message: Message, state: FSMContext) -> None
 
     status_msg = await message.reply("⏳ Перевіряю текст через Ollama...")
     try:
-        suggestion = await review_description(http_session, OLLAMA_URL, resolve_model(message.from_user.id), description)
+        suggestion = await review_description(
+            http_session, OLLAMA_URL, resolve_model(message.from_user.id), description,
+            keep_alive=resolve_keep_alive(message.from_user.id),
+        )
     except AiReviewUnavailable:
         logger.exception("AI review unavailable, falling back to the admin's original text")
         await status_msg.edit_text("⚠️ AI-перевірка зараз недоступна, використовую ваш текст без змін.")

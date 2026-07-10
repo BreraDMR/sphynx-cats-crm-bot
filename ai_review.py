@@ -1,8 +1,8 @@
 """Grammar/style review of a kitten description via Ollama.
 
-Uses the same OpenAI-compatible /v1/chat/completions endpoint as the other
-bot in this homelab (pc-tele-monitor-ai's gemma.py) -- just a single
-stateless request, no chat history to keep here.
+Uses Ollama's native /api/chat endpoint (not the OpenAI-compatible one) so we
+can pass keep_alive -- how long to keep the model resident after the request.
+Just a single stateless request, no chat history to keep here.
 """
 
 from __future__ import annotations
@@ -27,7 +27,13 @@ class AiReviewUnavailable(Exception):
     should fall back to the admin's original text rather than block on this."""
 
 
-async def review_description(session: aiohttp.ClientSession, ollama_url: str, model: str, text: str) -> str:
+async def review_description(
+    session: aiohttp.ClientSession,
+    ollama_url: str,
+    model: str,
+    text: str,
+    keep_alive: str = "5m",
+) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -35,17 +41,20 @@ async def review_description(session: aiohttp.ClientSession, ollama_url: str, mo
             {"role": "user", "content": text},
         ],
         "stream": False,
+        "keep_alive": keep_alive,
     }
 
-    endpoint = f"{ollama_url.rstrip('/')}/v1/chat/completions"
+    endpoint = f"{ollama_url.rstrip('/')}/api/chat"
 
+    # A big (very_strong) model on this CPU-only host can take minutes, plus a
+    # cold-start reload when it was unloaded -- keep the ceiling generous.
     try:
-        async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=600)) as resp:
             if resp.status != 200:
                 err_text = await resp.text()
                 raise AiReviewUnavailable(f"Ollama returned {resp.status}: {err_text[:200]}")
             result = await resp.json()
-            return result["choices"][0]["message"]["content"].strip()
+            return result["message"]["content"].strip()
     except aiohttp.ClientError as e:
         raise AiReviewUnavailable(str(e)) from e
     except (KeyError, IndexError) as e:
