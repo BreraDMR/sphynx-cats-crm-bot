@@ -8,7 +8,7 @@
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white&style=for-the-badge)](requirements.txt)
 [![Ollama](https://img.shields.io/badge/Ollama-local%20AI-000000?logo=ollama&logoColor=white&style=for-the-badge)](ai_review.py)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white&style=for-the-badge)](docker-compose.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
+[![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue?style=for-the-badge)](LICENSE)
 [![status](https://img.shields.io/badge/status-active-brightgreen?style=for-the-badge)](#)
 
 </div>
@@ -128,4 +128,7 @@ python3 bot.py
 
 ## License
 
-[MIT](LICENSE)
+Licensed under [PolyForm Noncommercial 1.0.0](LICENSE) — free for personal,
+educational, and other noncommercial use. Commercial use requires a separate
+license; contact damir.brera.eb@gmail.com.
+
